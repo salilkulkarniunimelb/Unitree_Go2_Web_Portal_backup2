@@ -41,7 +41,7 @@ PORT=7860
 # silently shows no map, no pose, no plan and no odom while the camera (which
 # is WebRTC, not DDS) keeps working -- so the dashboard looks half-alive.
 ROS_DOMAIN="${ROS_DOMAIN:-70}"
-FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh explorer_control.py"
+FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh exhibition_control.py"
 WEB_BACKEND_FILES="web_backend/qod_consumer.py web_backend/qod_detections.py"
 # Host-side (not container-side) helper that sets up the restricted SSH key the
 # explorer button uses. It is NOT copied into the container -- it runs on the

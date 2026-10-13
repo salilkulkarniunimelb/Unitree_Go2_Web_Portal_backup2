@@ -22,32 +22,24 @@ Layout mirrors the Hivemind mission dashboard:
     - Workflow stepper (mapping -> scenario -> localisation -> operations)
     - Robot fleet panel (Luna / Astro cards with live status)
     - Live occupancy map (center) + live camera (right)
-    - Explorer controls (Start/Stop Exploring) + log tail
+    - Exhibition mapping/localisation/patrol controls
     - Telemetry + status footer
     - "3D Map": a Foxglove-style 3D lidar page, served by the
       side-car web_backend/foxglove_viewer.py on port 8767 and embedded in an
       iframe, so orbit / pan / zoom work exactly like Foxglove's 3D panel.
 
-"Start Exploring" runs the split-compute explorer for the robot selected in the
-fleet panel: it starts that robot's Zenoh bridge, builds go2_hardware_autonomy
-+ orchestrator, then launches go2_explorer_splitcomp_server_launch.py. This
-container cannot do any of that itself -- it has no volume mounts and no ROS
-workspace -- so explorer_control.py drives the server host over a restricted
-SSH key that is pinned to one forced-command script, and the build and launch
-happen in the robot_hivemind compute container. The launch is detached once
-started, so exploration survives the browser closing or the portal restarting.
+Mission controls delegate to hardware_code's exhibitionctl.py over a restricted
+SSH forced command. The exhibition controller owns mapping, verified completed-
+map handover, per-robot localisation confirmation and the explicit patrol gate.
 
 Working features stream live (map, camera, battery, pose). Features not yet
 implemented (scenario/operations steps, ROS gateway, 5G link, RealSense/YOLO
 streams) have been removed from the layout until they are wired up.
 
 The page ALWAYS loads. Every section shows a "Waiting for ..." placeholder
-until its topic starts publishing. Click the map to publish a navigation goal
-for the selected robot on its goal topic (e.g. /astro/goal_pose) in the "map"
-frame. This drives the robot only when a navigation stack on the robot consumes
-that goal topic. Toggle "Set Initial Pose" and drag on the map to publish an
-initial pose (/initialpose) for the selected robot, like Foxglove's
-"2D Publish Pose".
+until its topic starts publishing. Direct click-to-goal is disabled in
+exhibition mode. Toggle "Set Initial Pose" and drag on the map to submit x/y/yaw
+through the exhibition controller, then confirm localisation separately.
 
 Usage:
     source /opt/ros/humble/setup.bash
@@ -56,7 +48,6 @@ Usage:
 
 import math
 import os
-import queue
 import threading
 import time
 import base64
@@ -68,19 +59,16 @@ import numpy as np
 
 import gradio as gr
 
-# Dashboard-side control of the split-compute explorer ("Start Exploring").
-# Imported defensively: this file IS the dashboard and boot.sh restarts it on
-# any exit, so a missing or renamed module would turn a deploy slip into a
-# portal that crash-loops instead of one that still serves the map. If the
-# import fails the explorer buttons report it and the rest of the page is
-# unaffected.
+# Dashboard-side client for hardware_code's exhibition workflow. Imported
+# defensively so a deployment slip cannot turn a missing control module into a
+# portal crash loop; telemetry remains available and controls report the error.
 try:
-    import explorer_control
+    import exhibition_control
 except Exception as _exc:  # noqa: BLE001 - must never take the dashboard down
-    explorer_control = None
-    EXPLORER_IMPORT_ERROR = repr(_exc)
+    exhibition_control = None
+    EXHIBITION_IMPORT_ERROR = repr(_exc)
 else:
-    EXPLORER_IMPORT_ERROR = None
+    EXHIBITION_IMPORT_ERROR = None
 
 # ----------------------- Topic names (lab-real) -----------------------
 # Topics actually publishing on the lab server (verified via ros2 topic list).
@@ -98,8 +86,6 @@ LUNA_TOPICS = {
     "camera":  "/luna/frontvideostream",
     "source":  "luna",
     "battery": "/lf/lowstate",
-    "goal":    "/luna/goal_pose",
-    "initialpose": "/luna/initialpose",
     "plan":    "/luna/plan",
     "map_odom": "/luna/go2/split_compute/map_odom_correction",
 }
@@ -111,8 +97,6 @@ ASTRO_TOPICS = {
     "camera":  "/astro/frontvideostream",
     "source":  "astro",
     "battery": "/lf/lowstate",
-    "goal":    "/astro/goal_pose",
-    "initialpose": "/astro/initialpose",
     "plan":    "/astro/plan",
     "map_odom": "/astro/go2/split_compute/map_odom_correction",
 }
@@ -179,11 +163,6 @@ DETECTION_CLASS_STYLES = {
 DEFAULT_DETECTION_STYLE = dict(alias="Object", color=(53, 255, 101))  # #35ff65
 
 FT_FRAME = "map"
-
-# Once the robot gets this close (meters) to the active goal, consider it
-# reached and clear the plotted path/goal marker from the map. Widen enough to
-# tolerate AMCL noise and Nav2 stopping a little short of the exact point.
-GOAL_REACHED_TOLERANCE = 1.0
 
 # ROS heading sources can stall (AMCL silent after start, or a one-shot /plan
 # that is only re-published per goal). AMCL pose/yaw is trusted only while
@@ -395,11 +374,7 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from geometry_msgs.msg import (
-    PoseStamped,
-    PoseWithCovarianceStamped,
-    TransformStamped,
-)
+from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import Image
 
@@ -493,30 +468,6 @@ DASHBOARD_CSS = """
        as a control that changes anything on the current page. */
     .switch-view-btn{margin-top:10px !important;font-weight:600 !important;}
 
-    /* Explorer buttons: colour the hover so the two actions read as
-       go/avoid at a glance. Pure CSS on :hover only -- no variant, label,
-       callback or enabled/disabled state is touched, so behaviour is
-       identical. Transparent-to-colour transitions rather than a colour
-       swap so the change is not jarring. */
-    .explore-start-btn{transition:background-color .15s ease,box-shadow .15s ease;}
-    .explore-start-btn:hover{background-color:#2e7d32 !important;
-        box-shadow:0 0 0 2px rgba(46,125,50,.45) !important;}
-    .explore-stop-btn{transition:background-color .15s ease,box-shadow .15s ease;}
-    .explore-stop-btn:hover{background-color:#c62828 !important;
-        box-shadow:0 0 0 2px rgba(198,40,40,.45) !important;}
-    /* Keep the label legible once the background is a saturated colour. */
-    .explore-start-btn:hover *,.explore-stop-btn:hover *{color:#fff !important;}
-    .goal-enable-btn,.goal-disable-btn{transition:background-color .15s ease,box-shadow .15s ease;}
-    /* Same green as .explore-start-btn: enabling is the affirmative action
-       in both sections, so they should look identical on hover. */
-    .goal-enable-btn:hover{background-color:#2e7d32 !important;
-        box-shadow:0 0 0 2px rgba(46,125,50,.45) !important;}
-    .goal-disable-btn:hover{background-color:#c62828 !important;
-        box-shadow:0 0 0 2px rgba(198,40,40,.45) !important;}
-    .goal-enable-btn:hover *,.goal-disable-btn:hover *{color:#fff !important;}
-
-    
-
     /* Tab navigation — style gradio tabs to look like nav buttons */
     .tab-nav{display:flex;gap:6px !important;margin-bottom:10px !important;padding:6px !important;
         background:var(--block-background-fill);border:1px solid var(--block-border-color);
@@ -586,7 +537,7 @@ DASHBOARD_CSS = """
 # captured (in image-pixel coords) and forwarded to a Python handler through a
 # small hidden Textbox bridge (initpose_bridge) by dispatching a DOM 'input'
 # event, which Gradio's `.input` listener picks up. When the "Set Initial Pose"
-# toggle is off, the backend ignores the payload, so goal-setting is unaffected.
+# toggle is off, the backend ignores the payload.
 INIT_POSE_JS = """<script>
 (function () {
     var ACTIVE = true;
@@ -726,8 +677,6 @@ INIT_POSE_JS = """<script>
         // Only publish when the "Set Initial Pose" toggle is checked.
         var toggle = resolveEl('#initpose_toggle input');
         var mode = toggle ? !!toggle.checked : false;
-        // Deterministic bridge: POST the drag directly to the Gradio API endpoint
-        // instead of depending on Gradio's component-event dispatch semantics.
         try {
             fetch('/gradio_api/call/drag_initial', {
                 method: 'POST',
@@ -767,7 +716,6 @@ class RobotState:
         self.yaw = 0.0
         self.odom_path = deque(maxlen=2000)
         self.pose_latest = "Waiting for pose..."
-        self.last_goal = None
         # --- Nav2 planned path (published by the robot's global planner on
         #     /luna|astro/plan when a navigation goal is being executed) ---
         self.planner_path = None          # list of (wx, wy) in the "map" frame
@@ -869,8 +817,6 @@ class RobotState:
         self.motor_status = None
         self.bat_stamp = 0.0
 
-        self._goal_queue = queue.Queue()
-        self._init_queue = queue.Queue()
 
         # Camera playback FPS diagnostic (rough): count frames popped vs wall time.
         self._cam_played = 0
@@ -1401,16 +1347,6 @@ class RobotState:
         mp = self.map_pose()
         if mp is not None:
             body_x, body_y, body_yaw = mp
-            # Once the robot arrives at the goal, clear the plan + goal marker
-            # so the path disappears from the map. "Arrived" = the current
-            # map-frame pose is within tolerance of the goal.
-            if self.last_goal is not None:
-                gx, gy = self.last_goal
-                d_now = math.hypot(body_x - gx, body_y - gy)
-                if d_now < GOAL_REACHED_TOLERANCE:
-                    self.planner_path = None
-                    self.last_goal = None
-
             # Nav2 planned path (the route the robot is about to take). Color
             # matches the robot: Luna = red, Astro = blue (same as its dot).
             colors = ROBOT_COLORS[self.name]
@@ -1419,14 +1355,6 @@ class RobotState:
                     [to_px(wx, wy) for wx, wy in self.planner_path], dtype=np.int32
                 )
                 _draw_plan(canvas, pts, colors["path_dark"], colors["path_bright"])
-
-            # Goal marker (orange crosshair + dot) at the last clicked point.
-            if self.last_goal is not None:
-                gx, gy = to_px(*self.last_goal)
-                cv2.circle(canvas, (gx, gy), 9, (0, 165, 255), 3, cv2.LINE_AA)
-                cv2.circle(canvas, (gx, gy), 3, (0, 165, 255), -1, cv2.LINE_AA)
-                cv2.line(canvas, (gx - 14, gy), (gx + 14, gy), (0, 165, 255), 2, cv2.LINE_AA)
-                cv2.line(canvas, (gx, gy - 14), (gx, gy + 14), (0, 165, 255), 2, cv2.LINE_AA)
 
             px, py = to_px(body_x, body_y)
             dot = colors["fill"]
@@ -1578,9 +1506,6 @@ class RobotState:
             return self.pose_latest
         bx, by, byaw = mp
         pos = (f"x: {bx:.3f}   y: {by:.3f}   yaw: {byaw:.3f} rad")
-        if self.last_goal:
-            return (f"{pos}\n🎯 last goal: "
-                    f"({self.last_goal[0]:.2f}, {self.last_goal[1]:.2f})")
         return pos
 
     def get_connection_status(self):
@@ -1603,12 +1528,12 @@ class RobotState:
     def _display_to_world(self, x, y):
         """Convert displayed-map image pixel coords (x = horizontal, y = vertical,
         matching Gradio's select evt.index = [x, y]) to world (wx, wy).
-        Mirrors the inverse of draw_map() used by click_to_goal()."""
+        Mirrors the inverse transform used by draw_map()."""
         if self.cached_meta is None:
             return None, None
         origin_x, origin_y, h, ox, oy, res = self.cached_meta
         canvas = self.cached_map_img.shape[0]
-        # undo the 90deg CW display rotation (same as click_to_goal)
+        # Undo the 90-degree clockwise display rotation.
         px = y
         py = canvas - 1 - x
         # undo scaling / centering, then the y-flip
@@ -1618,75 +1543,25 @@ class RobotState:
         wy = (h - 1 - myp) * res + origin_y
         return wx, wy
 
-    def set_initial_pose(self, wx, wy, yaw):
-        """Queue a PoseWithCovarianceStamped for the robot and remember it so it
-        is drawn on the map. Publishing happens on the dedicated node thread."""
-        msg = PoseWithCovarianceStamped()
-        msg.header.frame_id = FT_FRAME
-        msg.header.stamp = self.node.get_clock().now().to_msg()
-        msg.pose.pose.position.x = float(wx)
-        msg.pose.pose.position.y = float(wy)
-        msg.pose.pose.position.z = 0.0
-        # yaw about Z -> quaternion
-        half = yaw / 2.0
-        msg.pose.pose.orientation.z = math.sin(half)
-        msg.pose.pose.orientation.w = math.cos(half)
-        # heuristic initial covariance so Nav2/AMCL accepts it
-        msg.pose.covariance[0] = 0.25
-        msg.pose.covariance[7] = 0.25
-        msg.pose.covariance[35] = (30.0 * math.pi / 180.0) ** 2
-        self._init_queue.put(msg)
+    def set_initial_pose_marker(self, wx, wy, yaw):
+        """Remember a submitted exhibition pose so it is drawn on the map."""
         self.initial_pose = (float(wx), float(wy), float(yaw))
         self.last_initial = (float(wx), float(wy), float(yaw))
-        return (f"{self.name}: Initial pose set -> "
-                f"({wx:.3f}, {wy:.3f}) yaw {yaw:.3f} rad")
 
-    def drag_to_initial(self, press, release):
+    def pose_from_drag(self, press, release):
         """press/release = (x, y) displayed-pixel coords of a click-drag.
         Position = press point, yaw = direction of the drag. Mirrors Foxglove's
         "2D Publish Pose" tool."""
         if self.cached_meta is None:
-            return f"No {self.name} map yet (drag on the map once it loads)"
+            raise ValueError(f"No {self.name} map yet (drag on the map once it loads)")
         x1, y1 = press
         x2, y2 = release
         wx, wy = self._display_to_world(x1, y1)
         if wx is None:
-            return f"No {self.name} map yet"
+            raise ValueError(f"No {self.name} map yet")
         # world-frame yaw from the drag vector (see transform derivation)
         yaw = math.atan2(x2 - x1, y2 - y1)
-        return self.set_initial_pose(wx, wy, yaw)
-
-    # ---------------------- goal click ----------------------
-    def click_to_goal(self, evt: gr.SelectData):
-        if self.cached_meta is None:
-            return f"No {self.name} map yet"
-        origin_x, origin_y, h, ox, oy, res = self.cached_meta
-        idx = evt.index
-        row, col = idx[0], idx[1]
-        canvas = self.cached_map_img.shape[0]
-        # Invert the display pipeline (y-flip, then 90deg CW rotation):
-        #   py = canvas - 1 - row ; px = col
-        px = col
-        py = canvas - 1 - row
-        mx = (px - ox) / self.cached_scale
-        myp = (py - oy) / self.cached_scale
-        wx = mx * res + origin_x
-        wy = (h - 1 - myp) * res + origin_y
-        # Goal orientation: keep the robot's current heading so it drives to the
-        # clicked point (no heading requirement). Published on the goal topic
-        # (e.g. /astro/goal_pose) in the "map" frame.
-        goal = PoseStamped()
-        goal.header.frame_id = FT_FRAME          # "map"
-        goal.header.stamp = self.node.get_clock().now().to_msg()
-        goal.pose.position.x = float(wx)
-        goal.pose.position.y = float(wy)
-        goal.pose.position.z = 0.0
-        half = self.yaw / 2.0
-        goal.pose.orientation.z = math.sin(half)
-        goal.pose.orientation.w = math.cos(half)
-        self._goal_queue.put(goal)
-        self.last_goal = (wx, wy)
-        return f"{self.name}: Goal set -> ({wx:.3f}, {wy:.3f})"
+        return float(wx), float(wy), float(yaw)
 class LabRobotNode(Node):
     """Subscribes to map/pose/odom/camera/battery for every robot and exposes
     the currently-selected robot for rendering."""
@@ -1753,9 +1628,6 @@ class LabRobotNode(Node):
             if LowState is not None:
                 self.create_subscription(LowState, topics["battery"], robot.battery_cb, 10)
 
-            robot.goal_pub = self.create_publisher(PoseStamped, topics["goal"], 10)
-            robot.init_pub = self.create_publisher(
-                PoseWithCovarianceStamped, topics["initialpose"], 10)
             self.robots[name] = robot
             self.get_logger().info(
                 f"[{name}] Subscribed to {topics['map']}, {topics['pose']}, "
@@ -1763,12 +1635,7 @@ class LabRobotNode(Node):
             )
 
         self.current = "Luna"
-        self.patrol_robot = "Luna"
 
-        # Publish goals from a dedicated thread. rclpy publish() must NOT be
-        # called from a Gradio/anyio worker thread (it can corrupt the rclpy
-        # context and crash the whole process).
-        threading.Thread(target=self._goal_publish_loop, daemon=True).start()
         threading.Thread(target=self._diag_loop, daemon=True).start()
 
     def _diag_loop(self):
@@ -1806,38 +1673,6 @@ class LabRobotNode(Node):
                 self.get_logger().error(f"[DIAG] failed: {e}")
             threading.Event().wait(5.0)
 
-    def _goal_publish_loop(self):
-        while True:
-            for name, robot in self.robots.items():
-                try:
-                    init = robot._init_queue.get(timeout=0.0)
-                except queue.Empty:
-                    init = None
-                if init is not None:
-                    try:
-                        robot.init_pub.publish(init)
-                        self.get_logger().info(
-                            f"[{name}] Initial pose published -> "
-                            f"({init.pose.pose.position.x:.3f}, "
-                            f"{init.pose.pose.position.y:.3f})"
-                        )
-                    except Exception as e:
-                        self.get_logger().error(f"[{name}] Failed to publish initial pose: {e}")
-                try:
-                    goal = robot._goal_queue.get(timeout=0.0)
-                except queue.Empty:
-                    goal = None
-                if goal is not None:
-                    try:
-                        robot.goal_pub.publish(goal)
-                        self.get_logger().info(
-                            f"[{name}] Goal published -> "
-                            f"({goal.pose.position.x:.3f}, {goal.pose.position.y:.3f})"
-                        )
-                    except Exception as e:
-                        self.get_logger().error(f"[{name}] Failed to publish goal: {e}")
-            threading.Event().wait(0.1)
-
     # ---- the active robot's data ----
     @property
     def current_robot(self):
@@ -1870,19 +1705,10 @@ class LabRobotNode(Node):
     def get_connection_status(self):
         return self.current_robot.get_connection_status()
 
-    def click_to_goal(self, evt: gr.SelectData):
-        return self.current_robot.click_to_goal(evt)
-
-    def drag_to_initial(self, press, release):
-        return self.current_robot.drag_to_initial(press, release)
+    def pose_from_drag(self, press, release):
+        return self.current_robot.pose_from_drag(press, release)
 
     # ---- patrolling page ----
-    def set_patrol_robot(self, name):
-        if name in self.robots:
-            self.patrol_robot = name
-            return f"Patrol goal target: {name}"
-        return f"Unknown robot: {name}"
-
     def draw_patrol_map(self):
         """Render both robots, their paths and goals on a single occupancy
         grid.  The base map is taken from whichever robot has a live occupancy
@@ -1914,15 +1740,6 @@ class LabRobotNode(Node):
                 continue
             body_x, body_y, body_yaw = mp
             colors = ROBOT_COLORS.get(name, ROBOT_COLORS["Luna"])
-            # Goal-reached check: clears the plan so the path disappears. Only
-            # the current map-frame pose is compared to the goal.
-            if robot.last_goal is not None:
-                gx, gy = robot.last_goal
-                d_now = math.hypot(body_x - gx, body_y - gy)
-                if d_now < GOAL_REACHED_TOLERANCE:
-                    robot.planner_path = None
-                    robot.last_goal = None
-
             # Nav2 planned path (the route the robot is about to take), drawn in
             # the robot's colour with a light casing + black under-stroke.
             if robot.planner_path and len(robot.planner_path) >= 2:
@@ -1931,16 +1748,6 @@ class LabRobotNode(Node):
                     dtype=np.int32,
                 )
                 _draw_plan(canvas, pts, colors["path_dark"], colors["path_bright"])
-
-            # Goal marker (orange crosshair) at the last clicked point.
-            if robot.last_goal is not None:
-                gx, gy = to_px(*robot.last_goal)
-                cv2.circle(canvas, (gx, gy), 9, (0, 165, 255), 3, cv2.LINE_AA)
-                cv2.circle(canvas, (gx, gy), 3, (0, 165, 255), -1, cv2.LINE_AA)
-                cv2.line(canvas, (gx - 14, gy), (gx + 14, gy),
-                         (0, 165, 255), 2, cv2.LINE_AA)
-                cv2.line(canvas, (gx, gy - 14), (gx, gy + 14),
-                         (0, 165, 255), 2, cv2.LINE_AA)
 
             fill = colors.get("fill", (255, 0, 0))
             outline = colors.get("outline", (180, 0, 0))
@@ -1973,13 +1780,6 @@ class LabRobotNode(Node):
                     0.7, (0, 0, 0), 2)
 
         return canvas
-
-    def patrol_click_to_goal(self, evt: gr.SelectData):
-        """Forward a map click on the patrol page to the patrol-selected robot."""
-        robot = self.robots.get(self.patrol_robot)
-        if robot is None:
-            return "No robot selected for patrol"
-        return robot.click_to_goal(evt)
 
     def patrol_draw_cameras(self):
         """Return both robots' camera streams for the fleet camera panel."""
@@ -2060,6 +1860,7 @@ def main():
                             value=node.current,
                             label="Select Robot",
                             interactive=True,
+                            elem_id="robot_selector",
                             elem_classes=["robot-selector"],
                         )
 
@@ -2085,10 +1886,11 @@ def main():
 
                         # "Set Initial Pose" is hidden by default and only revealed
                         # via the toggle button below, so the map stays clean for
-                        # normal goal-clicking. Hiding also un-checks the toggle so
+                        # normal map viewing. Hiding also un-checks the toggle so
                         # the drag gesture is never silently active while hidden.
-                        initpose_btn = gr.Button("Set Initial Pose",
-                                                 elem_id="initpose_toggle_btn")
+                        initpose_btn = gr.Button(
+                            "Set Initial Pose", interactive=False,
+                            elem_id="initpose_toggle_btn")
                         initpose_visible = gr.State(value=False)
 
                         with gr.Column(visible=False, elem_id="initpose_section") as initpose_section:
@@ -2102,9 +1904,8 @@ def main():
                         map_img = gr.Image(show_label=False,
                                            type="numpy", elem_id="map_image", height=520)
 
-                        # Jump to the 3D view of the same world, placed above
-                        # the goal status so the map, the hop and the goal
-                        # readout stay adjacent. Navigation only: no data path,
+                        # Jump to the 3D view of the same world. Navigation only:
+                        # no data path,
                         # subscription or timer is touched, and the 2D map keeps
                         # running untouched on its own tab.
                         switch_to_3d_btn = gr.Button(
@@ -2114,7 +1915,8 @@ def main():
                             _goto_tab("foxglove-ui"),
                             inputs=None, outputs=page_tabs)
 
-                        goal_out = gr.Textbox(label="Goal Status", lines=1)
+                        map_interaction_out = gr.Textbox(
+                            label="Map Interaction", lines=1, interactive=False)
 
                         with gr.Row():
                             init_status = gr.Textbox(label="🟢 Initial Pose Status", lines=1,
@@ -2124,12 +1926,6 @@ def main():
 
                         gr.HTML('<div style="text-align:center;">🔴 Luna · 🟦 Astro</div>')
 
-                        # Jumps to the 3D view of the same world. Purely
-                        # navigation: no data path, no subscription and no timer
-                        # is touched, and the 2D map keeps running untouched on
-                        # its own tab.
-                        
-
                     # ---------- RIGHT: LIVE CAMERA ----------
                     with gr.Column(scale=1, elem_classes=["camera-panel"]):
                         gr.HTML('<h2 style="text-align:center;margin:0 0 8px;">Live Camera</h2>')
@@ -2137,69 +1933,45 @@ def main():
                                            type="numpy", height=300)
                         cam_fps_out = gr.Textbox(label="Stream FPS", lines=1, interactive=False)
 
-                # ================================================================
-                # EXPLORER CONTROLS
-                # "Start Exploring" reproduces the operator's manual sequence
-                # for the robot picked in "Select Robot": build
-                # go2_hardware_autonomy + orchestrator, then
-                # ros2 launch go2_explorer_splitcomp_server_launch.py.
-                #
-                # It returns immediately and drives the host over a restricted
-                # SSH key: a cold colcon build takes minutes, and the launch
-                # then runs until stopped. So the status box + log tail below
-                # track it while the call is in flight, and the detached
-                # launch keeps going if this portal dies.
-                #
-                # It DOES start the Zenoh bridge -- on the host, over that same
-                # SSH connection, before the build (see explorer_control.py).
-                # ================================================================
+                # Exhibition workflow controls. hardware_code/exhibitionctl.py is
+                # the authority for state, process ownership and motion gates.
                 with gr.Row():
                     with gr.Column(scale=1, min_width=320):
-                        gr.Markdown("#### EXPLORER")
-                        # The explanatory blurb was removed at the operator's
-                        # request. The section is now just the heading, the two
-                        # buttons and the log, which is self-explanatory.
-                        # Stacked rather than side by side: at half page width
-                        # two buttons per row leaves too little space for
-                        # "Disable Goal Setting" and it wraps.
-                        explore_start_btn = gr.Button(
-                            "Start Exploring", variant="primary",
-                            elem_classes=["explore-start-btn"])
-                        explore_stop_btn = gr.Button(
-                            "Stop Exploring", variant="stop",
-                            elem_classes=["explore-stop-btn"])
-                        explore_status = gr.Textbox(
-                            label="Explorer Status", lines=2, interactive=False)
+                        gr.Markdown("#### MAPPING")
+                        mapping_start_btn = gr.Button(
+                            "Start Mapping", variant="primary", interactive=False)
+                        mapping_stop_btn = gr.Button(
+                            "Stop Mapping", variant="stop", interactive=False)
+                        mapping_partial_btn = gr.Button(
+                            "Stop & Save Partial Map", interactive=False)
 
-                    # GOAL SETTING reads left-to-right after EXPLORER: explore
-                    # first, then enable goal setting on the map exploration
-                    # produced. Press Enable after Stop Exploring; it runs in the
-                    # same robot container and reuses the zenoh bridge that Stop
-                    # Exploring leaves running.
                     with gr.Column(scale=1, min_width=320):
-                        gr.Markdown("#### GOAL SETTING")
-                        # Load a map instead of re-exploring: pick a saved map
-                        # (or the latest one exploration wrote) and Enable Goal
-                        # Setting localises BOTH robots on it. Choices are the
-                        # *.yaml maps on the SERVER, populated fresh each page
-                        # load and on Refresh; they are not shipped with the
-                        # dashboard and not read from any developer's checkout.
+                        gr.Markdown("#### LOCALISATION")
                         map_dd = gr.Dropdown(
-                            label="Map (latest explored / saved)",
+                            label="Completed Map (latest five)",
                             choices=[], value=None, interactive=True,
                             elem_classes=["map-selector"])
+                        team_dd = gr.Dropdown(
+                            label="Robot Team",
+                            choices=[("Both robots", "both"), ("Luna only", "luna"),
+                                     ("Astro only", "astro")],
+                            value="both", interactive=True)
                         map_refresh_btn = gr.Button(
-                            "Refresh Maps", variant="secondary",
-                            elem_classes=["goal-refresh-btn"])
-                        goal_enable_btn = gr.Button(
-                            "Enable Goal Setting", variant="primary",
-                            elem_classes=["goal-enable-btn"])
-                        goal_disable_btn = gr.Button(
-                            "Disable Goal Setting", variant="stop",
-                            elem_classes=["goal-disable-btn"])
-                        goal_status = gr.Textbox(
-                            label="Goal Setting Status", lines=2,
-                            interactive=False)
+                            "Refresh Maps", variant="secondary")
+                        localisation_prepare_btn = gr.Button(
+                            "Prepare Localisation", variant="primary", interactive=False)
+                        cleanup_btn = gr.Button(
+                            "End Patrol & Clean Up", variant="stop", interactive=False)
+
+                with gr.Row():
+                    confirm_luna_btn = gr.Button(
+                        "Confirm Luna Localisation", interactive=False)
+                    confirm_astro_btn = gr.Button(
+                        "Confirm Astro Localisation", interactive=False)
+
+                mission_status_out = gr.Textbox(
+                    label="Exhibition Workflow", lines=9, interactive=False)
+                action_result_out = gr.JSON(label="Last Controller Result")
 
                 # ================================================================
                 # BOTTOM ROW: POSE + STATUS FOOTER
@@ -2260,23 +2032,135 @@ def main():
                 )
 
                 def on_map_select(mode, evt: gr.SelectData):
+                    del evt
                     if mode:
-                        return ("Initial Pose mode ON — press and drag on the map to "
-                                "set the initial pose (position + orientation).")
-                    return node.click_to_goal(evt)
+                        return ("Initial Pose mode ON — drag from position toward the "
+                                "desired heading, then wait for controller confirmation.")
+                    return "Direct navigation goals are disabled in exhibition mode."
 
                 def on_drag_payload(payload, mode):
                     if not mode:
                         return "Initial pose drag ignored — toggle \"Set Initial Pose\" ON."
+                    if exhibition_control is None:
+                        return f"Exhibition controls unavailable: {EXHIBITION_IMPORT_ERROR}"
                     if not payload or "," not in payload:
                         return "No drag data received."
                     try:
+                        robot_label = node.current
                         x1, y1, x2, y2 = [int(x) for x in payload.split(",")]
-                    except Exception:
-                        return f"Bad drag payload: {payload!r}"
-                    return node.drag_to_initial((x1, y1), (x2, y2))
+                        x, y, yaw = node.pose_from_drag((x1, y1), (x2, y2))
+                        result = exhibition_control.set_initial_pose(
+                            robot_label, x, y, yaw)
+                        node.robots[robot_label].set_initial_pose_marker(x, y, yaw)
+                    except Exception as exc:
+                        return f"Initial pose failed: {exc}"
+                    return (f"{robot_label}: pose submitted at ({x:.3f}, {y:.3f}), "
+                            f"yaw {yaw:.3f} rad. Confirm localisation separately. "
+                            f"Workflow: {result.get('workflow_state', 'unknown')}")
 
-                map_img.select(on_map_select, inputs=init_toggle, outputs=goal_out)
+                def _control_missing():
+                    return {
+                        "state": "error",
+                        "error": f"exhibition_control unavailable: {EXHIBITION_IMPORT_ERROR}",
+                    }
+
+                def _run(action, *args):
+                    if exhibition_control is None:
+                        return _control_missing()
+                    try:
+                        return action(*args)
+                    except Exception as exc:
+                        return {"state": "error", "error": str(exc)}
+
+                def _run_named(name, *args):
+                    if exhibition_control is None:
+                        return _control_missing()
+                    return _run(getattr(exhibition_control, name), *args)
+
+                def _mission_summary(state):
+                    workflow = state.get("workflow_state") or state.get("state", "unknown")
+                    explorer = state.get("selected_explorer") or "none"
+                    team = ", ".join(state.get("patrol_robots") or []) or "none"
+                    handover = state.get("map_handover") or {}
+                    map_info = handover.get("yaml") or (state.get("map") or {}).get("yaml") or "none"
+                    localisation = state.get("localisation") or {}
+                    ready = []
+                    for name in ("luna", "astro"):
+                        item = localisation.get(name) or {}
+                        ready.append(
+                            f"{name.title()}: pose={'yes' if item.get('pose_submitted') else 'no'}, "
+                            f"confirmed={'yes' if item.get('confirmed') else 'no'}"
+                        )
+                    processes = state.get("robots") or {}
+                    process_lines = []
+                    for name in ("luna", "astro"):
+                        item = processes.get(name) or {}
+                        process_lines.append(
+                            f"{name.title()} process: {item.get('mode') or 'none'} / "
+                            f"{item.get('health') or item.get('state') or 'unknown'}"
+                        )
+                    error = state.get("last_error") or state.get("error") or "none"
+                    return (f"State: {workflow}\nExplorer: {explorer}\nTeam: {team}\n"
+                            f"Map: {map_info}\n" + "\n".join(process_lines + ready)
+                            + f"\nError: {error}")
+
+                def on_mission_tick():
+                    state = _run(exhibition_control.mission_status) \
+                        if exhibition_control is not None else _control_missing()
+                    workflow = state.get("workflow_state") or state.get("state")
+                    mapping = workflow in {
+                        "starting_exploration", "exploring", "completion_pending",
+                        "saving_map", "map_ready",
+                    }
+                    selected = state.get("patrol_robots") or []
+                    localising = workflow in {"awaiting_localisation", "ready_to_patrol"}
+                    cleanup = workflow in {
+                        "preparing_localisation", "awaiting_localisation",
+                        "ready_to_patrol", "patrolling", "error",
+                    }
+                    return (
+                        _mission_summary(state),
+                        gr.update(interactive=workflow in {"idle", "map_ready"}),
+                        gr.update(interactive=mapping),
+                        gr.update(interactive=workflow in {
+                            "starting_exploration", "exploring", "completion_pending"}),
+                        gr.update(interactive=workflow in {
+                            "idle", "map_ready", "awaiting_localisation", "ready_to_patrol"}),
+                        gr.update(interactive=cleanup),
+                        gr.update(interactive=localising and "luna" in selected),
+                        gr.update(interactive=localising and "astro" in selected),
+                        gr.update(interactive=localising),
+                    )
+
+                def on_refresh_maps(current):
+                    if exhibition_control is None:
+                        return gr.update(choices=[], value=None), _control_missing()
+                    try:
+                        maps = exhibition_control.list_maps()
+                    except Exception as exc:
+                        return gr.update(choices=[], value=None), {
+                            "state": "error", "error": str(exc)}
+                    valid = [item for item in maps if item.get("valid")][:5]
+                    choices = [
+                        (item.get("id") or item["yaml"].rsplit("/", 1)[-1],
+                         item["yaml"].rsplit("/", 1)[-1])
+                        for item in valid
+                    ]
+                    values = [value for _, value in choices]
+                    selected = current if current in values else (values[0] if values else None)
+                    return gr.update(choices=choices, value=selected), {
+                        "state": "maps", "count": len(choices)}
+
+                def on_prepare(map_name, team):
+                    if not map_name:
+                        return {"state": "error", "error": "select a completed map"}
+                    return _run_named("prepare_localisation", map_name, team)
+
+                def on_confirm(robot):
+                    return _run_named("confirm_localisation", robot)
+
+                map_img.select(
+                    on_map_select, inputs=init_toggle, outputs=map_interaction_out)
 
                 # Reveal / hide the "Set Initial Pose" option. Hiding also forces
                 # the checkbox off so the hidden toggle can't leave the drag
@@ -2296,206 +2180,67 @@ def main():
                 )
                 # Exposed as a public Gradio API endpoint ("drag_initial") so the browser
                 # drag JS can POST the payload directly (POST /gradio_api/call/drag_initial
-                # with {"data": [payload, mode]}). This is a deterministic bridge that works
+                # with {"data": [payload, mode]}). This deterministic bridge works
                 # regardless of Gradio's component-event semantics. The endpoint is bound to
                 # init_bridge.input so it also works on the legacy event path.
-                init_bridge.input(on_drag_payload, inputs=[init_bridge, init_toggle],
+                init_bridge.input(on_drag_payload,
+                                  inputs=[init_bridge, init_toggle],
                                   outputs=init_status, api_name="drag_initial")
 
                 robot_dd.change(node.set_robot, robot_dd, None)
-
-                # --- Explorer handlers -------------------------------------
-                # Action feedback ("already exploring", "unknown robot", a
-                # refused SIGKILL) has to survive the status tick below: that
-                # tick refreshes the same textbox every 2s, so a message
-                # written straight into it would be overwritten before anyone
-                # could read it. Hold it for a few seconds and let the tick
-                # prepend it while it is still fresh.
-                ACTION_MSG_TTL = 8.0
-                _action_msg = {"text": "", "at": 0.0}
-
-                def _hold(text):
-                    _action_msg["text"] = text
-                    _action_msg["at"] = time.time()
-                    return text
-
-                def _explorer_missing():
-                    return (
-                        f"❌ explorer_control is not available "
-                        f"({EXPLORER_IMPORT_ERROR}). Re-run restore_dashboard.sh "
-                        "to deploy it.",
-                        "",
-                    )
-
-                def on_start_exploring(robot):
-                    if explorer_control is None:
-                        return _explorer_missing()
-                    status, log = explorer_control.start(robot)
-                    return _hold(status), log
-
-                def on_stop_exploring():
-                    if explorer_control is None:
-                        return _explorer_missing()
-                    status, log = explorer_control.stop()
-                    return _hold(status), log
-
-                def on_explorer_tick():
-                    if explorer_control is None:
-                        return _explorer_missing()
-                    status, log = explorer_control.status()
-                    if _action_msg["text"] and \
-                            time.time() - _action_msg["at"] < ACTION_MSG_TTL:
-                        status = f"{_action_msg['text']}\n{status}"
-                    return status, log
-
-                # ---------- BOTTOM: EXPLORER LOG ----------
-                # Declared last so it renders at the foot of the page: Gradio
-                # orders components by declaration order. The wiring below has
-                # to stay after this, because .click()/.tick() read explore_log
-                # when they are registered, so it must already exist by then.
-                with gr.Column(visible=False) as logs_panel:
-                    gr.Markdown("#### EXPLORER LOG")
-                    explore_log = gr.Textbox(
-                        show_label=False, lines=12, max_lines=12,
-                        interactive=False)
-
-                    # ---------- BOTTOM: GOAL SETTING LOG ----------
-                    # Shares the log textbox with the explorer buttons above,
-                    # for the same reason they are declared together: the
-                    # callbacks close over goal_log, so it must exist before
-                    # they are wired.
-                    gr.Markdown("#### GOAL SETTING LOG")
-                    goal_log = gr.Textbox(
-                        show_label=False, lines=8, max_lines=8,
-                        interactive=False)
-
-                # ---------- SHOW LOGS ----------
-                # Both logs are inside logs_panel, which starts hidden, so the
-                # button at the foot of the page is the only thing revealed.
-                # The logs themselves are untouched: the 2s timer still writes
-                # to both textboxes whether or not they are on screen, so
-                # pressing Show Logs after a run shows what already accumulated.
-                logs_visible = gr.State(value=False)
-
-                show_logs_btn = gr.Button(
-                    "Show Logs", variant="secondary")
-
-                # Mirrors how "Set Initial Pose" behaves (see
-                # toggle_initpose_section above): a gr.State holds the current
-                # visibility, the click flips it, the panel follows the state
-                # and the button relabels itself to the inverse action. State
-                # defaults to False, so every page load starts from Show Logs
-                # with both logs hidden.
-                def on_toggle_logs(visible):
-                    new_visible = not visible
-                    label = ("Hide Logs" if new_visible else "Show Logs")
-                    return new_visible, gr.update(visible=new_visible), gr.update(value=label)
-
-                show_logs_btn.click(
-                    on_toggle_logs, inputs=logs_visible,
-                    outputs=[logs_visible, logs_panel, show_logs_btn],
-                    api_name="show_logs")
-
-                # api_name exposes these as Gradio API endpoints
-                # (POST /gradio_api/call/start_exploring with {"data": ["Luna"]}),
-                # matching the drag_initial endpoint above, so the explorer can
-                # also be driven from a script instead of only by clicking.
-                explore_start_btn.click(
-                    on_start_exploring, inputs=robot_dd,
-                    outputs=[explore_status, explore_log],
-                    api_name="start_exploring")
-                explore_stop_btn.click(
-                    on_stop_exploring, inputs=None,
-                    outputs=[explore_status, explore_log],
-                    api_name="stop_exploring")
-                explore_timer = gr.Timer(2.0)
-                explore_timer.tick(on_explorer_tick,
-                                   outputs=[explore_status, explore_log],
-                                   api_name="explorer_status")
-
-                def on_goal_enable(map_name):
-                    if explorer_control is None:
-                        return ("❌ explorer_control is not available, so Goal "
-                                "Setting cannot be enabled.", "")
-                    return explorer_control.patrol_start(map_name)
-
-                def on_goal_disable():
-                    if explorer_control is None:
-                        return ("❌ explorer_control is not available, so Goal "
-                                "Setting cannot be disabled.")
-                    return explorer_control.patrol_stop()
-
-                def on_goal_tick():
-                    if explorer_control is None:
-                        return ("⚪ Goal Setting is unavailable.")
-                    return explorer_control.patrol_status()
-
-                def on_refresh_maps(current):
-                    """Repopulate the map picker from the server.
-
-                    Keeps the current selection if it still exists, otherwise
-                    falls back to the newest map, so a Refresh after a new
-                    exploration does not silently switch the operator onto a
-                    different map than the one they had selected.
-                    """
-                    if explorer_control is None:
-                        return (gr.update(choices=[], value=None),
-                                "❌ explorer_control is not available, so saved "
-                                "maps cannot be listed.")
-                    choices, error = explorer_control.list_maps()
-                    if not choices:
-                        return (gr.update(choices=[], value=None),
-                                f"ℹ️ {error or 'No saved maps found on the server.'}")
-                    values = [value for _, value in choices]
-                    value = current if current in values else values[0]
-                    return (gr.update(choices=choices, value=value),
-                            f"🗺️ {len(choices)} map(s) available. "
-                            "Select one, then Enable Goal Setting.")
-
-                # Endpoint names are exposed to the Gradio API too
-                # (POST /gradio_api/call/enable_goal_setting with
-                # {"data": ["map.yaml"]}), so a map can also be loaded from a
-                # script rather than only by clicking.
-                goal_enable_btn.click(
-                    on_goal_enable, inputs=map_dd,
-                    outputs=[goal_status, goal_log],
-                    api_name="enable_goal_setting")
-                goal_disable_btn.click(
-                    on_goal_disable, inputs=None,
-                    outputs=[goal_status, goal_log],
-                    api_name="disable_goal_setting")
+                mapping_start_btn.click(
+                    lambda robot: _run_named("start_mapping", robot),
+                    inputs=robot_dd, outputs=action_result_out,
+                    api_name="start_mapping")
+                mapping_stop_btn.click(
+                    lambda robot: _run_named("stop_mapping", robot, False),
+                    inputs=robot_dd, outputs=action_result_out,
+                    api_name="stop_mapping")
+                mapping_partial_btn.click(
+                    lambda robot: _run_named("stop_mapping", robot, True),
+                    inputs=robot_dd, outputs=action_result_out,
+                    api_name="stop_mapping_partial")
+                localisation_prepare_btn.click(
+                    on_prepare, inputs=[map_dd, team_dd], outputs=action_result_out,
+                    api_name="prepare_localisation")
+                cleanup_btn.click(
+                    lambda: _run_named("stop_patrol"),
+                    outputs=action_result_out, api_name="stop_patrol")
+                confirm_luna_btn.click(
+                    lambda: on_confirm("luna"), outputs=action_result_out,
+                    api_name="confirm_localisation_luna")
+                confirm_astro_btn.click(
+                    lambda: on_confirm("astro"), outputs=action_result_out,
+                    api_name="confirm_localisation_astro")
                 map_refresh_btn.click(
                     on_refresh_maps, inputs=map_dd,
-                    outputs=[map_dd, goal_status],
+                    outputs=[map_dd, action_result_out],
                     api_name="refresh_maps")
-                # Populate the picker once per page load. A failure here only
-                # leaves the picker empty with a message; the rest of the page
-                # (map, camera, explorer) is unaffected.
                 demo.load(
                     on_refresh_maps, inputs=map_dd,
-                    outputs=[map_dd, goal_status],
+                    outputs=[map_dd, action_result_out],
                     api_name="load_maps")
-                goal_timer = gr.Timer(2.0)
-                goal_timer.tick(on_goal_tick,
-                                outputs=[goal_status, goal_log],
-                                api_name="goal_setting_status")
+                mission_timer = gr.Timer(3.0)
+                mission_timer.tick(
+                    on_mission_tick,
+                    outputs=[mission_status_out, mapping_start_btn, mapping_stop_btn,
+                             mapping_partial_btn, localisation_prepare_btn,
+                             cleanup_btn, confirm_luna_btn, confirm_astro_btn,
+                             initpose_btn],
+                    api_name="mission_status")
 
             # ================================================================
             # TAB 2: FLEET VIEW (both robots on one map)
             # ================================================================
             with gr.Tab("Fleet View", id="patrolling"):
-                # ---------- TOP ROW: GOAL TARGET (L) + FLEET MAP (C) + CAMERA (R) ----------
+                # Read-only fleet overview. Motion is owned by the exhibition
+                # controller and polygon patrol planner, never a map click.
                 with gr.Row():
-                    # LEFT: Goal Target Robot selector
                     with gr.Column(scale=1, elem_classes=["fleet-panel"]):
-                        gr.Markdown("#### GOAL TARGET")
-                        patrol_robot_dd = gr.Dropdown(
-                            choices=list(ROBOTS.keys()),
-                            value=node.patrol_robot,
-                            label="Goal Target Robot",
-                            interactive=True,
-                            elem_classes=["robot-selector"],
-                        )
+                        gr.Markdown("#### EXHIBITION MODE")
+                        gr.Markdown(
+                            "Fleet map interaction is read-only. Use the Mapping "
+                            "tab for initial pose and the Patrolling tab for motion.")
 
                     # CENTER: Fleet Patrolling Map (both robots)
                     with gr.Column(scale=2, elem_classes=["map-panel"]):
@@ -2503,7 +2248,6 @@ def main():
                         patrol_map_img = gr.Image(
                             show_label=False, type="numpy", elem_id="patrol_map_image", height=520)
                         gr.HTML('<div style="text-align:center;">🔴 Luna · 🟦 Astro</div>')
-                        patrol_goal_out = gr.Textbox(label="Goal Status", lines=1, interactive=False)
 
                     # RIGHT: Fleet Camera — streams from BOTH robots
                     with gr.Column(scale=1, elem_classes=["camera-panel"]):
@@ -2542,13 +2286,6 @@ def main():
                              patrol_conn_astro, patrol_pose_astro],
                 )
 
-                def on_patrol_map_select(evt: gr.SelectData):
-                    return node.patrol_click_to_goal(evt)
-
-                patrol_map_img.select(on_patrol_map_select, inputs=None,
-                                      outputs=patrol_goal_out)
-                patrol_robot_dd.change(node.set_patrol_robot, patrol_robot_dd, None)
-
             # ================================================================
             # TAB 3: UI PATOL (embedded polygon-constrained patrol planner)
             # The patrol planner runs in the same robot_hivemind container on
@@ -2558,9 +2295,50 @@ def main():
             with gr.Tab("Patrolling", id="patrol-ui"):
                 gr.Markdown("#### POLYGON-CONSTRAINED PATROL PLANNER")
                 gr.Markdown(
-                    "Draw a patrol region on the map below, run the planner, "
-                    "then dispatch Luna / Astro through the planned checkpoints."
+                    "Prepare localisation and confirm every selected robot first. "
+                    "Draw the patrol region below, then use the explicit motion gate."
                 )
+                with gr.Row():
+                    patrol_start_btn = gr.Button(
+                        "Start Patrol", variant="primary", interactive=False)
+                    patrol_stop_btn = gr.Button(
+                        "End Patrol & Clean Up", variant="stop", interactive=False)
+                patrol_workflow_out = gr.Textbox(
+                    label="Patrol Readiness", lines=9, interactive=False)
+                patrol_action_out = gr.JSON(label="Last Patrol Result")
+                patrol_start_btn.click(
+                    lambda: _run_named("start_patrol"), outputs=patrol_action_out,
+                    api_name="start_patrol")
+                patrol_stop_btn.click(
+                    lambda: _run_named("stop_patrol"), outputs=patrol_action_out,
+                    api_name="end_patrol")
+
+                def on_patrol_tick():
+                    state = _run_named("mission_status")
+                    selected = state.get("patrol_robots") or []
+                    localisation = state.get("localisation") or {}
+                    all_confirmed = bool(selected) and all(
+                        (localisation.get(name) or {}).get("confirmed") is True
+                        for name in selected
+                    )
+                    can_start = (
+                        state.get("workflow_state") == "ready_to_patrol"
+                        and all_confirmed
+                    )
+                    can_stop = state.get("workflow_state") in {
+                        "preparing_localisation", "awaiting_localisation",
+                        "ready_to_patrol", "patrolling", "error",
+                    }
+                    return (
+                        _mission_summary(state),
+                        gr.update(interactive=can_start),
+                        gr.update(interactive=can_stop),
+                    )
+
+                patrol_control_timer = gr.Timer(3.0)
+                patrol_control_timer.tick(
+                    on_patrol_tick,
+                    outputs=[patrol_workflow_out, patrol_start_btn, patrol_stop_btn])
                 gr.HTML(
                     '<iframe src="http://localhost:8766/" '
                     'style="width:100%; height:900px; border:0; '

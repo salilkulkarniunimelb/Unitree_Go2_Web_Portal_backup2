@@ -29,7 +29,8 @@ HOST="${SERVER#*@}"
 # whose entrypoint is a bare shell and never serves 7860.
 CONTAINER="${CONTAINER:-robot_hivemind_portal}"
 PORT=7860
-FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh explorer_control.py"
+FILES="lab_portal.py lab_start.sh start_dashboard.sh boot.sh exhibition_control.py"
+CONTROL_SSH="${CONTROL_SSH:-selini.samaranayake@10.4.48.11}"
 
 # The "Foxglove view" tab's 3D viewer: a side-car module plus the Three.js
 # page and the vendored library it loads. Copied separately because they live in
@@ -45,24 +46,24 @@ if [ ! -f lab_portal.py ]; then
     exit 1
 fi
 
-echo "[1/5] Checking container $CONTAINER exists..."
+echo "[1/6] Checking container $CONTAINER exists..."
 if ! ssh -o BatchMode=yes "$SERVER" "docker inspect $CONTAINER >/dev/null 2>&1"; then
     echo "ERROR: container '$CONTAINER' does not exist on the server."
     echo "Create it once with:  bash restore_dashboard.sh"
     exit 1
 fi
 
-echo "[2/5] Copying dashboard files into container..."
+echo "[2/6] Copying dashboard files into container..."
 scp -o BatchMode=yes $FILES "$SERVER:/tmp/"
 ssh -o BatchMode=yes "$SERVER" "for f in $FILES; do docker cp /tmp/\$f $CONTAINER:/workspace/\$f; done"
 ssh -o BatchMode=yes "$SERVER" "docker exec $CONTAINER chmod +x /workspace/lab_start.sh /workspace/start_dashboard.sh /workspace/boot.sh"
 
-echo "[3/5] Ensuring Python deps present (installs only if missing)..."
+echo "[3/6] Ensuring Python deps present (installs only if missing)..."
 # websockets is what the 3D viewer's WebSocket feed is built on; it is already
 # in the image, but the check keeps a rebuilt image from silently losing the tab.
 ssh -o BatchMode=yes "$SERVER" "docker exec $CONTAINER bash -lc 'python3 -c \"import gradio,numpy,cv2,websockets\" 2>/dev/null || python3 -m pip install --no-cache-dir \"numpy<2\" \"opencv-python-headless<5\" gradio websockets'"
 
-echo "[4/5] Copying 3D viewer files (Foxglove view tab)..."
+echo "[4/6] Copying 3D viewer files (Foxglove view tab)..."
 # The viewer is a Python module under web_backend/ plus a static page and a
 # vendored copy of three.js under web_frontend/. Shipped as one tar so the
 # directory structure survives the trip without needing docker cp to create
@@ -82,9 +83,18 @@ ssh -o BatchMode=yes "$SERVER" "\
     docker exec $CONTAINER rm -f /tmp/foxglove_viewer_deploy.tar"
 rm -f "$VIEWER_TAR"
 
-echo "[5/5] Restarting portal in container..."
+echo "[5/6] Deploying the restricted exhibition-control boundary..."
+HOST_WRAPPER='$HOME/.config/lab-portal-explorer/explorer_host.sh'
+ssh -o BatchMode=yes "$CONTROL_SSH" \
+    "mkdir -p \$(dirname $HOST_WRAPPER) && chmod 700 \$(dirname $HOST_WRAPPER) && cat > $HOST_WRAPPER && chmod +x $HOST_WRAPPER" \
+    < scripts/dashboard/explorer_host.sh
+ssh -o BatchMode=yes "$CONTROL_SSH" \
+    "cat > \$HOME/install_explorer_key.sh && bash \$HOME/install_explorer_key.sh" \
+    < scripts/dashboard/install_explorer_key.sh
+
+echo "[6/6] Restarting portal in container..."
 # Restart the container rather than just the portal process: boot.sh is copied
-# in at [2/5], after the entrypoint already ran, so the running PID 1 is still
+# in at [2/6], after the entrypoint already ran, so the running PID 1 is still
 # whatever was baked into the image. Restarting makes the container re-exec the
 # boot.sh we just deployed, so its watchdog is the one actually supervising the
 # portal (otherwise the portal dies and nothing restarts it).
